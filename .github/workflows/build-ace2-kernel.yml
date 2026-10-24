@@ -71,6 +71,58 @@
 # is not a failure: UFW REJECT support is a nice-to-have, Droidspaces
 # itself does not need it, and the Collect step reports the final .config.
 #
+# v5 (2026-10-25): fixed the run-40114120519 ABI failure. The kernel ACTUALLY
+# COMPILED in 5m46s (vmlinux, Image, Image.lz4 produced), then build.sh
+# failed at its final GKI ABI check:
+#   "ERROR: Differences between ksymtab and symbol list detected!
+#    Symbols missing from ksymtab: __cfi_slowpath, kasan_flag_enabled"
+# Root cause, verified against the AOSP 5.10 sources and the run-3 log:
+#   * __cfi_slowpath is EXPORT_SYMBOL'd by kernel/cfi.c, which is only
+#     compiled when CONFIG_CFI_CLANG=y. No kernel/cfi.o appears anywhere
+#     in the run-3 build log, so the final merged .config has CFI off --
+#     even though common gki_defconfig sets CONFIG_CFI_CLANG=y and
+#     CONFIG_LTO_CLANG_FULL=y. The waipio vendor fragments (and/or the
+#     oplus script's LTO prompt, whose default is "none") turn it off.
+#   * kasan_flag_enabled is defined ONLY in mm/kasan/hw_tags.c, i.e. only
+#     when CONFIG_KASAN_HW_TAGS=y. The run-3 log compiles the GENERIC
+#     KASAN objects (generic.o, report_generic.o, shadow.o, quarantine.o)
+#     and no hw_tags.o / report_hw_tags.o, so the final .config runs
+#     generic KASAN, not HW-tags KASAN. KASAN_HW_TAGS needs
+#     HAVE_ARCH_KASAN_HW_TAGS (arm64 MTE); the vendor config evidently
+#     does not select it, so Kconfig falls back to the default
+#     KASAN_GENERIC. (Kconfig.kasan: the mode choice defaults to GENERIC.)
+#   * The generic GKI symbol list (android/abi_gki_aarch64) was written
+#     for a config with CFI + HW-tags KASAN on, so a vendor config that
+#     legitimately disables both can NEVER satisfy a strict exact-match
+#     check. This is a known 5.10 GKI/vendor mismatch (same two symbols
+#     in an XDA thread building a Pixel 5.10 GKI kernel).
+# Fix -- the build system's own escape hatch, NOT a symbol-list edit and
+# NOT enabling CFI/KASAN (both would change the kernel and risk vendor
+# module loading): set KMI_SYMBOL_LIST_STRICT_MODE=0. AOSP's
+# build.config.gki.aarch64 defines it as ${KMI_SYMBOL_LIST_STRICT_MODE:-1},
+# i.e. explicitly env-overridable, and AOSP's own debug GKI variant sets
+# strict mode off. With 0, build.sh skips the compare_to_symbol_list
+# exact-match gate; TRIM_NONLISTED_KMI stays 1, so the kernel's exported
+# symbols are still trimmed to the GKI list, and the compiled kernel is
+# byte-identical to run 3's -- only the post-build gate changes. The two
+# missing symbols are only referenced by CFI/KASAN-instrumented code,
+# which is off in this config, and the stock OnePlus build uses the same
+# waipio fragments, so stock vendor modules cannot reference them either
+# (boot test on the phone remains the real gate, as always).
+# Companion fix, same run: oplus_rebuild_img.sh cannot succeed in this
+# public-tree CI -- it needs stock origin images
+# (oplus/prebuild/origin_img/{boot,system_dlkm,vendor_dlkm,vendor_boot}.img)
+# and tools (7z_new, info_image, ...) that are NOT in the public tree;
+# it tries to fetch them from OnePlus's internal IMAGE_SERVER
+# (gpw13.myoas.com, unreachable) and fails. Run 3's rebuild_img errors
+# are that missing-input failure, not a kernel problem. So the step now
+# runs rebuild_img best-effort (|| true, with a warning): if it ever
+# succeeds we get a boot.img too, but the artifact is the compiled
+# Image + final .config + BUILD_INFO. Repacking a flashable boot.img is
+# a separate step that needs the stock boot backup (checklist Stage 1).
+# Collect/Upload now run `if: always()` so a failed build still uploads
+# BUILD_INFO + final .config for diagnosis.
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -134,6 +186,12 @@ jobs:
       MANIFEST_FILE: oneplus_ace2_b.xml
       COMMON_DIR: kernel_platform/common
       DEFCONFIG: kernel_platform/common/arch/arm64/configs/gki_defconfig
+      # v5: AOSP GKI ABI strict mode off -- see header. The generic GKI
+      # symbol list assumes CFI + KASAN_HW_TAGS, both off in the OnePlus
+      # waipio vendor config; strict exact-match can never pass. This
+      # changes no kernel code or config, only the post-build gate.
+      # TRIM_NONLISTED_KMI stays at its default (1).
+      KMI_SYMBOL_LIST_STRICT_MODE: '0'
 
     steps:
       # MUST be first, even before checkout: this action mounts a volume over
@@ -387,12 +445,32 @@ jobs:
         run: |
           set -euxo pipefail
           cd kernel
+          echo "KMI_SYMBOL_LIST_STRICT_MODE=${KMI_SYMBOL_LIST_STRICT_MODE:-<unset>}"
           chmod +x kernel_platform/oplus/build/oplus_build_kernel.sh
           chmod +x kernel_platform/oplus/build/oplus_rebuild_img.sh
           ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio gki
-          ./kernel_platform/oplus/build/oplus_rebuild_img.sh waipio gki
+          # Record the ground truth for the CFI/KASAN question: which of
+          # these the final merged .config actually has. (Run 3: CFI off,
+          # KASAN_GENERIC on, KASAN_HW_TAGS off -- that is what made the
+          # strict ABI check fail; it is the vendor config, not our edit.)
+          FINAL_CONFIG="$(find kernel_platform/out -name .config -path '*gki_kernel/common*' | head -n 1 || true)"
+          if [ -n "$FINAL_CONFIG" ]; then
+            {
+              echo "=== final .config: CFI / KASAN / LTO ==="
+              grep -E "^#? ?CONFIG_(CFI_CLANG|CFI_PERMISSIVE|LTO_CLANG|LTO_CLANG_FULL|LTO_CLANG_THIN|KASAN|KASAN_GENERIC|KASAN_HW_TAGS|ARM64_MTE|SHADOW_CALL_STACK)=" "$FINAL_CONFIG" || echo "(no CFI/KASAN/LTO lines found)"
+            } | tee -a ../BUILD_INFO.txt
+          fi
+          # v5: rebuild_img is best-effort only. It repacks boot.img from
+          # stock origin images (oplus/prebuild/origin_img/*) that are NOT
+          # in the public OnePlus tree and are fetched from OnePlus's
+          # internal IMAGE_SERVER, which is unreachable from GitHub
+          # runners -- so it cannot succeed here. Do not let it fail the
+          # job: the compiled Image is the artifact. If it ever succeeds,
+          # Collect picks up the boot.img as a bonus.
+          ./kernel_platform/oplus/build/oplus_rebuild_img.sh waipio gki || echo "WARNING: oplus_rebuild_img.sh failed (expected without stock origin images); continuing with the compiled Image"
 
       - name: Collect artifacts
+        if: always()
         run: |
           set -euxo pipefail
           mkdir -p artifacts
@@ -422,9 +500,10 @@ jobs:
           ls -lh artifacts/
 
       - name: Upload kernel artifact
+        if: always()
         uses: actions/upload-artifact@v4
         with:
           name: ace2-kernel-${{ inputs.build_mode }}
           path: artifacts/
-          if-no-files-found: error
+          if-no-files-found: warn
           retention-days: 30
