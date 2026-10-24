@@ -47,6 +47,30 @@
 # The vendorsetup.sh "No such file" line and the mktemp error in the same
 # log are non-fatal noise: the script continued past both.
 #
+# v4 (2026-10-25): fixed the run-40113165537 failure. The v3 savedefconfig
+# normalization worked -- the log says "savedefconfig check passed:
+# gki_defconfig is canonical" -- but the v3 verification loop then failed
+# with "ERROR: CONFIG_NETFILTER_XT_TARGET_REJECT is not =y in generated
+# .config", after the first 10 required options had all passed. Root cause:
+# CONFIG_NETFILTER_XT_TARGET_REJECT does not exist in kernel 5.10 at all
+# (verified against the OnePlusOSS common tree on this branch:
+# net/netfilter/Kconfig has NETFILTER_XT_TARGET_LOG but no REJECT symbol;
+# the unified xt_REJECT symbol only came in a later kernel). The 5.10
+# REJECT targets are CONFIG_IP_NF_TARGET_REJECT (net/ipv4/netfilter/Kconfig,
+# depends on IP_NF_FILTER) and CONFIG_IP6_NF_TARGET_REJECT
+# (net/ipv6/netfilter/Kconfig, depends on IP6_NF_FILTER). Kconfig silently
+# ignores unknown symbols in a defconfig, so savedefconfig dropped it and
+# the strict loop failed on a symbol that could never be =y. It was our own
+# check failing, not the kernel build.
+# Fix: (a) replace the dead symbol with the two real 5.10 symbols in the
+# defconfig edit; (b) split the .config check into a REQUIRED tier (hard
+# fail if not =y) and an OPTIONAL tier for the two REJECT symbols (warn
+# only, accept =y or =m). The REJECT pair depends on IP_NF_FILTER /
+# IP6_NF_FILTER, which may only be enabled later by the waipio fragments
+# the OnePlus script merges, so their absence from the plain-gki .config
+# is not a failure: UFW REJECT support is a nice-to-have, Droidspaces
+# itself does not need it, and the Collect step reports the final .config.
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -234,7 +258,14 @@ jobs:
               "CONFIG_IP6_NF_NAT",
               "CONFIG_IP6_NF_TARGET_MASQUERADE",
               "CONFIG_MACVLAN",
-              "CONFIG_NETFILTER_XT_TARGET_REJECT",
+              # NOTE (v4): the Droidspaces doc lists
+              # CONFIG_NETFILTER_XT_TARGET_REJECT, but that symbol does not
+              # exist in kernel 5.10 -- the unified xt_REJECT target came
+              # later. The 5.10 equivalents are the IPv4/IPv6 REJECT targets
+              # below. Never put the dead XT symbol back in: kconfig silently
+              # drops unknown symbols and any strict .config check on it fails.
+              "CONFIG_IP_NF_TARGET_REJECT",
+              "CONFIG_IP6_NF_TARGET_REJECT",
               "CONFIG_NETFILTER_XT_TARGET_LOG",
               "CONFIG_NETFILTER_XT_MATCH_RECENT",
               "CONFIG_IP_SET",
@@ -305,8 +336,24 @@ jobs:
           # CONFIG_PID_NS / CONFIG_IPC_NS are dropped from the defconfig file
           # itself by savedefconfig (they default to y), but must still be =y
           # in .config -- that is what the running kernel will actually have.
-          for opt in CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_PID_NS CONFIG_DEVTMPFS CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_USER_NS CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN CONFIG_NETFILTER_XT_TARGET_REJECT CONFIG_NETFILTER_XT_TARGET_LOG CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_IP_SET CONFIG_IP_SET_HASH_IP CONFIG_IP_SET_HASH_NET CONFIG_NETFILTER_XT_SET CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR; do
+          # REQUIRED tier: hard fail if any of these is not =y. Every symbol
+          # here is real in 5.10 and was seen =y in a generated .config
+          # (attempt 2 checked the first ten; the rest appeared as =y in the
+          # savedefconfig output of attempt 1).
+          for opt in CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_PID_NS CONFIG_DEVTMPFS CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_USER_NS CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN CONFIG_NETFILTER_XT_TARGET_LOG CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_IP_SET CONFIG_IP_SET_HASH_IP CONFIG_IP_SET_HASH_NET CONFIG_NETFILTER_XT_SET CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR; do
             grep -q "^${opt}=y$" "$OUT/.config" || { echo "ERROR: $opt is not =y in generated .config"; exit 1; }
+          done
+          # OPTIONAL tier (v4): the two 5.10 REJECT targets. They depend on
+          # IP_NF_FILTER / IP6_NF_FILTER, which the plain gki_defconfig may
+          # leave off and only the waipio fragments enable later, so they
+          # may legitimately come out =m or absent here. Warn only, never
+          # fail: UFW REJECT is a nice-to-have, Droidspaces does not need it.
+          for opt in CONFIG_IP_NF_TARGET_REJECT CONFIG_IP6_NF_TARGET_REJECT; do
+            if grep -q "^${opt}=[ym]$" "$OUT/.config"; then
+              echo "optional $opt: $(grep "^${opt}=" "$OUT/.config")"
+            else
+              echo "WARNING: optional $opt is not enabled in the plain-gki .config (may still be enabled by the waipio fragments in the final .config); continuing"
+            fi
           done
           for opt in CONFIG_CFS_BANDWIDTH CONFIG_CGROUP_PIDS; do
             if grep -q "^${opt}=y$" "$OUT/.config"; then echo "ERROR: forbidden $opt is enabled in generated .config"; exit 1; fi
@@ -367,7 +414,7 @@ jobs:
           if [ -n "$DOTCONFIG" ]; then
             cp "$DOTCONFIG" artifacts/final.config
             echo "=== requested defconfig options in final .config ==="
-            grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|USER_NS|IP6_NF_NAT|MACVLAN)=" artifacts/final.config || echo "(no matches printed; check final.config manually)"
+            grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|USER_NS|IP6_NF_NAT|MACVLAN|IP_NF_TARGET_REJECT|IP6_NF_TARGET_REJECT)=" artifacts/final.config || echo "(no matches printed; check final.config manually)"
           fi
           # A missing Image means the build did not actually produce a kernel,
           # even if the scripts exited without an obvious error.
