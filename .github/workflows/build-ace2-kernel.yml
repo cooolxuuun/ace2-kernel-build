@@ -231,6 +231,19 @@
 # is uploaded best-effort, plus a dmesg tail, so the next silent
 # death leaves evidence to distinguish OOM from disk-full.
 #
+# v12 (2026-10-25): run 10 (40131966133) failed at the v9 gate in
+# Normalize after ~6 min -- but it was OUR OWN v11 BUG, not the
+# kernel: v11 changed the gate to require LTO_CLANG_THIN=y, while
+# stock gki_defconfig sets LTO_CLANG_FULL=y and nothing in the
+# workflow edits it to THIN. The run-10 partial artifact proves it:
+# its normalized .config has LTO_CLANG_FULL=y, CFI_CLANG=y,
+# KASAN_HW_TAGS=y and GENERIC off -- everything else in the gate had
+# already passed; only the THIN requirement tripped. The gate was
+# checking the wrong thing for LTO: the plain-gki .config never
+# decides the final LTO mode (the build-time LTO argument does).
+# Fix: the Normalize gate now accepts FULL or THIN. The Build-step
+# gate still requires THIN, since the build applies thin.
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -539,13 +552,27 @@ jobs:
           # dependency, which is how runs 4-7 lost LTO/CFI). If this gate
           # fails, the run stops here with a clear message instead of
           # shipping a kernel that bootloops the phone.
-          for opt in CONFIG_LTO_CLANG_THIN CONFIG_CFI_CLANG CONFIG_KASAN_HW_TAGS; do
+          # v12: accept LTO_CLANG_FULL=y OR LTO_CLANG_THIN=y. Stock
+          # gki_defconfig sets FULL; the build-time LTO argument
+          # (thin in v11) selects the actual mode later as a fragment.
+          # The gate's job is to catch Normalize silently dropping the
+          # LTO option (the run 4-7 bug), not to pick the mode. Run 10
+          # failed here only because v11 required THIN while the stock
+          # defconfig still said FULL -- CFI and HW_TAGS had already
+          # passed. The Build-step gate still requires THIN, since the
+          # build applies thin.
+          if grep -q "^CONFIG_LTO_CLANG_FULL=y$" "$OUT2/.config" || grep -q "^CONFIG_LTO_CLANG_THIN=y$" "$OUT2/.config"; then
+            echo "v9 gate: LTO mode present: $(grep -E '^CONFIG_LTO_CLANG_(FULL|THIN)=y$' "$OUT2/.config")"
+          else
+            echo "ERROR: v9 gate: neither CONFIG_LTO_CLANG_FULL nor CONFIG_LTO_CLANG_THIN is =y in the normalized .config"; exit 1
+          fi
+          for opt in CONFIG_CFI_CLANG CONFIG_KASAN_HW_TAGS; do
             grep -q "^${opt}=y$" "$OUT2/.config" || { echo "ERROR: v9 gate: $opt is not =y in the normalized .config"; exit 1; }
           done
           for opt in CONFIG_KASAN_GENERIC CONFIG_KASAN_VMALLOC CONFIG_LTO_NONE; do
             if grep -q "^${opt}=y$" "$OUT2/.config"; then echo "ERROR: v9 gate: $opt is =y in the normalized .config"; exit 1; fi
           done
-          echo "v9 gate passed: LTO_THIN + CFI + KASAN_HW_TAGS present, GENERIC/VMALLOC/LTO_NONE absent"
+          echo "v9 gate passed: LTO (FULL or THIN) + CFI + KASAN_HW_TAGS present, GENERIC/VMALLOC/LTO_NONE absent"
           # Authoritative option check against the generated .config. Note that
           # CONFIG_PID_NS / CONFIG_IPC_NS are dropped from the defconfig file
           # itself by savedefconfig (they default to y), but must still be =y
