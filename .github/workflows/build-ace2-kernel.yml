@@ -214,6 +214,23 @@
 # PATH when present. If the v9 gate still trips, its error names the
 # exact option that is still off.
 #
+# v11 (2026-10-25): run 9 (40125829960) -- the v9 gate PASSED for the
+# first time (Normalize success), so the v10 CROSS_COMPILE fix worked.
+# But the Build step then failed after ~65 min of compiling with NO
+# LOG AT ALL (run log download 404 BlobNotFound, log zip 22 bytes /
+# empty, no annotations, no artifacts). That pattern -- long build,
+# sudden death, zero log -- is most consistent with the runner being
+# OOM-killed during the full-LTO link (standard runner: 16 GB RAM +
+# 4 GB swap; full-LTO link is notorious for this), but it is NOT
+# proven from the available evidence. Changes: (a) LTO full -> thin.
+# Thin LTO still selects LTO_CLANG, so CFI_CLANG still turns on and
+# the vendor modules still get __cfi_slowpath, but the link uses far
+# less memory. The v9 gate now requires LTO_CLANG_THIN instead of
+# FULL. (b) swap 4G -> 8G in maximize-build-space. (c) A background
+# resource monitor (free/df every 60s) runs during the Build step and
+# is uploaded best-effort, plus a dmesg tail, so the next silent
+# death leaves evidence to distinguish OOM from disk-full.
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -292,7 +309,7 @@ jobs:
         with:
           root-reserve-mb: 8192
           temp-reserve-mb: 2048
-          swap-size-mb: 4096
+          swap-size-mb: 8192
           remove-dotnet: 'true'
           remove-android: 'true'
           remove-haskell: 'true'
@@ -515,20 +532,20 @@ jobs:
           diff -u arch/arm64/configs/gki_defconfig "$OUT2/defconfig"
           echo "savedefconfig check passed: gki_defconfig is canonical"
           # v9 gate (hard fail): the normalized .config MUST keep the stock
-          # ABI options. LTO_CLANG_FULL + CFI_CLANG + KASAN_HW_TAGS are what
+          # ABI options. LTO_CLANG_THIN + CFI_CLANG + KASAN_HW_TAGS are what
           # the stock vendor modules were built against; KASAN_GENERIC and
           # KASAN_VMALLOC must NOT be on (VMALLOC requires GENERIC, and
           # GENERIC kills HAS_LTO_CLANG via its "!KASAN || KASAN_HW_TAGS"
           # dependency, which is how runs 4-7 lost LTO/CFI). If this gate
           # fails, the run stops here with a clear message instead of
           # shipping a kernel that bootloops the phone.
-          for opt in CONFIG_LTO_CLANG_FULL CONFIG_CFI_CLANG CONFIG_KASAN_HW_TAGS; do
+          for opt in CONFIG_LTO_CLANG_THIN CONFIG_CFI_CLANG CONFIG_KASAN_HW_TAGS; do
             grep -q "^${opt}=y$" "$OUT2/.config" || { echo "ERROR: v9 gate: $opt is not =y in the normalized .config"; exit 1; }
           done
           for opt in CONFIG_KASAN_GENERIC CONFIG_KASAN_VMALLOC CONFIG_LTO_NONE; do
             if grep -q "^${opt}=y$" "$OUT2/.config"; then echo "ERROR: v9 gate: $opt is =y in the normalized .config"; exit 1; fi
           done
-          echo "v9 gate passed: LTO_FULL + CFI + KASAN_HW_TAGS present, GENERIC/VMALLOC/LTO_NONE absent"
+          echo "v9 gate passed: LTO_THIN + CFI + KASAN_HW_TAGS present, GENERIC/VMALLOC/LTO_NONE absent"
           # Authoritative option check against the generated .config. Note that
           # CONFIG_PID_NS / CONFIG_IPC_NS are dropped from the defconfig file
           # itself by savedefconfig (they default to y), but must still be =y
@@ -602,6 +619,11 @@ jobs:
         run: |
           set -euxo pipefail
           cd kernel
+          # v11: background resource monitor (memory/disk every 60s) so
+          # a silent runner death (OOM during the LTO link, like run 9)
+          # leaves evidence in the artifact. Killed at the end of this
+          # step; Collect uploads the log best-effort.
+          ( while true; do echo "--- $(date -u +%H:%M:%S) ---"; free -h; df -h / /tmp; sleep 60; done > ../resource-monitor.log 2>&1 & echo $! > ../resource-monitor.pid )
           echo "KMI_SYMBOL_LIST_STRICT_MODE=${KMI_SYMBOL_LIST_STRICT_MODE:-<unset>}"
           chmod +x kernel_platform/oplus/build/oplus_build_kernel.sh
           chmod +x kernel_platform/oplus/build/oplus_rebuild_img.sh
@@ -620,9 +642,16 @@ jobs:
           # Fix: pass "full" as the 3rd argument (choose_lto_type $3)
           # and export LTO=full as belt-and-braces. Expect a longer
           # build and higher link memory; the 360-min timeout and the
-          # 4G swap from maximize-build-space cover it.
-          export LTO=full
-          ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio gki full
+          # swap from maximize-build-space cover it.
+          # v11: run 9 died in the Build step after ~65 min with NO log
+          # at all (log download 404, empty zip) -- most consistent
+          # with the runner being OOM-killed during the full-LTO link.
+          # Thin LTO still enables CFI (CFI_CLANG depends on LTO_CLANG,
+          # which both FULL and THIN select) so the vendor modules get
+          # __cfi_slowpath, but its link uses far less memory. Switch
+          # to thin; the v9 gate below is updated to require THIN.
+          export LTO=thin
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio gki thin
           # Record the ground truth for the CFI/KASAN question: which of
           # these the final merged .config actually has. (Run 3: CFI off,
           # KASAN_GENERIC on, KASAN_HW_TAGS off -- that is what made the
@@ -635,17 +664,17 @@ jobs:
             } | tee -a ../BUILD_INFO.txt
           fi
           # v9 gate (hard fail): the final merged .config MUST match the
-          # stock ABI -- LTO_CLANG_FULL, CFI_CLANG and KASAN_HW_TAGS =y.
+          # stock ABI -- LTO_CLANG_THIN, CFI_CLANG and KASAN_HW_TAGS =y.
           # If this fails, the kernel will bootloop the phone exactly
           # like runs 4-7 did; stop here instead of uploading it.
           if [ -z "$FINAL_CONFIG" ]; then echo "ERROR: v9 gate: no final .config found"; exit 1; fi
-          for opt in CONFIG_LTO_CLANG_FULL CONFIG_CFI_CLANG CONFIG_KASAN_HW_TAGS; do
+          for opt in CONFIG_LTO_CLANG_THIN CONFIG_CFI_CLANG CONFIG_KASAN_HW_TAGS; do
             grep -q "^${opt}=y$" "$FINAL_CONFIG" || { echo "ERROR: v9 gate: $opt is not =y in final .config -- kernel would not boot; see workflow header v9"; exit 1; }
           done
           for opt in CONFIG_KASAN_GENERIC CONFIG_KASAN_VMALLOC CONFIG_LTO_NONE; do
             if grep -q "^${opt}=y$" "$FINAL_CONFIG"; then echo "ERROR: v9 gate: $opt is =y in final .config"; exit 1; fi
           done
-          echo "v9 gate passed in final .config: LTO_FULL + CFI + KASAN_HW_TAGS present"
+          echo "v9 gate passed in final .config: LTO_THIN + CFI + KASAN_HW_TAGS present"
           # v5: rebuild_img is best-effort only. It repacks boot.img from
           # stock origin images (oplus/prebuild/origin_img/*) that are NOT
           # in the public OnePlus tree and are fetched from OnePlus's
@@ -654,6 +683,7 @@ jobs:
           # job: the compiled Image is the artifact. If it ever succeeds,
           # Collect picks up the boot.img as a bonus.
           ./kernel_platform/oplus/build/oplus_rebuild_img.sh waipio gki || echo "WARNING: oplus_rebuild_img.sh failed (expected without stock origin images); continuing with the compiled Image"
+          kill "$(cat ../resource-monitor.pid 2>/dev/null)" 2>/dev/null || true
 
       - name: Collect artifacts
         if: always()
@@ -661,6 +691,8 @@ jobs:
           set -euxo pipefail
           mkdir -p artifacts
           cp BUILD_INFO.txt artifacts/ || true
+          cp resource-monitor.log artifacts/ 2>/dev/null || true
+          dmesg 2>/dev/null | tail -n 100 > artifacts/dmesg-tail.txt || true
           # The oplus scripts' exact output directory can vary by tree version,
           # so locate the products instead of hard-coding one path.
           IMAGE="$(find kernel -name Image -type f -path '*arch/arm64/boot/*' | head -n 1 || true)"
