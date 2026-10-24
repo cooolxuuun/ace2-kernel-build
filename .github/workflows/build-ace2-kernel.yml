@@ -166,6 +166,34 @@
 # __cfi_slowpath / kasan_flag_enabled are in the generated ABI
 # symbol list (non-fatal, diagnostic only).
 #
+# v9 (2026-10-25): RUN 7 PROVED THE v8 FIX DID NOTHING. Run 7
+# (40122803801) concluded success, but its Image is byte-identical
+# to runs 4-6 (same SHA-256) and its final.config still has
+# CONFIG_LTO_NONE=y, no CFI, KASAN_GENERIC=y, KASAN_HW_TAGS off --
+# even though the build log shows "Modifying LTO mode to 'full'"
+# and scripts/config enabling LTO_CLANG_FULL. Root cause, traced to
+# the Kconfig sources: HAS_LTO_CLANG depends on
+# "!KASAN || KASAN_HW_TAGS", and our build ends up with
+# KASAN_GENERIC=y, so HAS_LTO_CLANG is false and the olddefconfig
+# right after the LTO modification reverts the choice to its
+# default LTO_NONE. And the KASAN mode itself is lost one step
+# earlier: the Normalize step ran `make gki_defconfig` with PLAIN
+# HOST make (gcc), where CC_IS_CLANG=n, so savedefconfig silently
+# dropped CONFIG_LTO_CLANG_FULL / CONFIG_CFI_CLANG (and the KASAN
+# mode lines) from gki_defconfig before the real build ever saw
+# them. Fix: (a) Normalize now runs kconfig with LLVM=1 + the
+# prebuilt clang on PATH, exactly like the real build; (b) a hard
+# v9 gate in Normalize AND in the Build step fails the run if the
+# .config does not have LTO_CLANG_FULL=y, CFI_CLANG=y and
+# KASAN_HW_TAGS=y, or if KASAN_GENERIC / KASAN_VMALLOC / LTO_NONE
+# are =y -- so a bad config fails in CI with a clear message
+# instead of shipping a kernel that bootloops the phone. (c) The
+# Collect symbol check now greps the actual Image for the two
+# symbols (ksymtab strings) instead of abi_symbollist, which is
+# only the EXPECTED list and wrongly reported both symbols OK in
+# run 7. Do NOT flash any run 4-7 Image: they are all the same
+# non-LTO kernel.
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -419,20 +447,50 @@ jobs:
           # against gki_defconfig, failing the build on ANY difference. A text
           # edit alone can never match that canonical layout, so normalize
           # the file with the kernel's own kconfig tooling first.
-          # Plain `make` (no LLVM/CROSS_COMPILE) is enough here: defconfig
-          # generation only builds the host kconfig tool, it compiles nothing.
+          # v9: run kconfig with the REAL toolchain (LLVM=1 + the prebuilt
+          # clang on PATH), NOT plain host make. Kconfig options depend on
+          # the compiler: with host gcc, CC_IS_CLANG=n, so HAS_LTO_CLANG is
+          # false and savedefconfig SILENTLY drops CONFIG_LTO_CLANG_FULL /
+          # CONFIG_CFI_CLANG from gki_defconfig. That is exactly what
+          # happened in runs 4-7: the file lost the stock LTO/CFI lines,
+          # the build then defaulted to LTO_NONE=y with no CFI, and the
+          # phone bootlooped because stock vendor modules need CFI. The
+          # prebuilt clang dir is pinned by build.config.common
+          # (CLANG_PREBUILT_BIN); glob it as a fallback.
           cd kernel/kernel_platform/common
+          CLANG_BIN="$(ls -d "$PWD/../prebuilts-master/clang/host/linux-x86/clang-r416183b/bin" 2>/dev/null || ls -d "$PWD/../prebuilts-master/clang/host/linux-x86/clang-"*/bin 2>/dev/null | head -n 1 || true)"
+          if [ -n "$CLANG_BIN" ] && [ -x "$CLANG_BIN/clang" ]; then
+            export PATH="$CLANG_BIN:$PATH"
+            echo "Normalize: using prebuilt clang $CLANG_BIN ($("$CLANG_BIN/clang" --version | head -n 1))"
+          else
+            echo "::warning::Normalize: prebuilt clang not found; kconfig will resolve without LLVM and the v9 gate below will catch a bad result"
+          fi
           OUT="$PWD/../out/defconfig-check"
-          make ARCH=arm64 O="$OUT" gki_defconfig
-          make ARCH=arm64 O="$OUT" savedefconfig
+          make LLVM=1 LLVM_IAS=1 ARCH=arm64 O="$OUT" gki_defconfig
+          make LLVM=1 LLVM_IAS=1 ARCH=arm64 O="$OUT" savedefconfig
           cp "$OUT/defconfig" arch/arm64/configs/gki_defconfig
           # Re-run savedefconfig into a fresh dir: this is exactly the check
           # the OnePlus script performs, and the diff must now be empty.
           OUT2="$PWD/../out/defconfig-check2"
-          make ARCH=arm64 O="$OUT2" gki_defconfig
-          make ARCH=arm64 O="$OUT2" savedefconfig
+          make LLVM=1 LLVM_IAS=1 ARCH=arm64 O="$OUT2" gki_defconfig
+          make LLVM=1 LLVM_IAS=1 ARCH=arm64 O="$OUT2" savedefconfig
           diff -u arch/arm64/configs/gki_defconfig "$OUT2/defconfig"
           echo "savedefconfig check passed: gki_defconfig is canonical"
+          # v9 gate (hard fail): the normalized .config MUST keep the stock
+          # ABI options. LTO_CLANG_FULL + CFI_CLANG + KASAN_HW_TAGS are what
+          # the stock vendor modules were built against; KASAN_GENERIC and
+          # KASAN_VMALLOC must NOT be on (VMALLOC requires GENERIC, and
+          # GENERIC kills HAS_LTO_CLANG via its "!KASAN || KASAN_HW_TAGS"
+          # dependency, which is how runs 4-7 lost LTO/CFI). If this gate
+          # fails, the run stops here with a clear message instead of
+          # shipping a kernel that bootloops the phone.
+          for opt in CONFIG_LTO_CLANG_FULL CONFIG_CFI_CLANG CONFIG_KASAN_HW_TAGS; do
+            grep -q "^${opt}=y$" "$OUT2/.config" || { echo "ERROR: v9 gate: $opt is not =y in the normalized .config"; exit 1; }
+          done
+          for opt in CONFIG_KASAN_GENERIC CONFIG_KASAN_VMALLOC CONFIG_LTO_NONE; do
+            if grep -q "^${opt}=y$" "$OUT2/.config"; then echo "ERROR: v9 gate: $opt is =y in the normalized .config"; exit 1; fi
+          done
+          echo "v9 gate passed: LTO_FULL + CFI + KASAN_HW_TAGS present, GENERIC/VMALLOC/LTO_NONE absent"
           # Authoritative option check against the generated .config. Note that
           # CONFIG_PID_NS / CONFIG_IPC_NS are dropped from the defconfig file
           # itself by savedefconfig (they default to y), but must still be =y
@@ -538,6 +596,18 @@ jobs:
               grep -E "^#? ?CONFIG_(CFI_CLANG|CFI_PERMISSIVE|LTO_CLANG|LTO_CLANG_FULL|LTO_CLANG_THIN|KASAN|KASAN_GENERIC|KASAN_HW_TAGS|ARM64_MTE|SHADOW_CALL_STACK)=" "$FINAL_CONFIG" || echo "(no CFI/KASAN/LTO lines found)"
             } | tee -a ../BUILD_INFO.txt
           fi
+          # v9 gate (hard fail): the final merged .config MUST match the
+          # stock ABI -- LTO_CLANG_FULL, CFI_CLANG and KASAN_HW_TAGS =y.
+          # If this fails, the kernel will bootloop the phone exactly
+          # like runs 4-7 did; stop here instead of uploading it.
+          if [ -z "$FINAL_CONFIG" ]; then echo "ERROR: v9 gate: no final .config found"; exit 1; fi
+          for opt in CONFIG_LTO_CLANG_FULL CONFIG_CFI_CLANG CONFIG_KASAN_HW_TAGS; do
+            grep -q "^${opt}=y$" "$FINAL_CONFIG" || { echo "ERROR: v9 gate: $opt is not =y in final .config -- kernel would not boot; see workflow header v9"; exit 1; }
+          done
+          for opt in CONFIG_KASAN_GENERIC CONFIG_KASAN_VMALLOC CONFIG_LTO_NONE; do
+            if grep -q "^${opt}=y$" "$FINAL_CONFIG"; then echo "ERROR: v9 gate: $opt is =y in final .config"; exit 1; fi
+          done
+          echo "v9 gate passed in final .config: LTO_FULL + CFI + KASAN_HW_TAGS present"
           # v5: rebuild_img is best-effort only. It repacks boot.img from
           # stock origin images (oplus/prebuild/origin_img/*) that are NOT
           # in the public OnePlus tree and are fetched from OnePlus's
@@ -572,17 +642,17 @@ jobs:
           # list. Diagnostic only -- never fails the run.
           IMAGELZ4="$(find kernel -name Image.lz4 -type f -path '*arch/arm64/boot/*' | head -n 1 || true)"
           if [ -n "$IMAGELZ4" ]; then cp "$IMAGELZ4" artifacts/; fi
-          {
-            echo "=== v8 ABI symbol list check ==="
-            SYMLIST="$(find kernel -name abi_symbollist -type f | head -n 1 || true)"
-            if [ -n "$SYMLIST" ]; then
-              for sym in __cfi_slowpath kasan_flag_enabled; do
-                if grep -q "^${sym}$" "$SYMLIST"; then echo "SYMBOL OK   $sym present in abi_symbollist"; else echo "SYMBOL MISSING $sym NOT in abi_symbollist"; fi
-              done
-            else
-              echo "(no abi_symbollist found)"
-            fi
-          } | tee -a artifacts/BUILD_INFO.txt || true
+          # v9: check the ACTUAL Image for the two symbols (they live in
+          # the kernel's ksymtab string table when exported). The old
+          # check grepped abi_symbollist, which is only the EXPECTED list
+          # and wrongly reported both symbols OK in run 7 while the Image
+          # had neither. Warn only -- a stripped Image can in principle
+          # hide the strings -- the hard gate is the .config check above.
+          if [ -f artifacts/Image ]; then
+            for sym in __cfi_slowpath kasan_flag_enabled; do
+              if strings artifacts/Image | grep -q "^${sym}$"; then echo "SYMBOL OK   $sym present in Image ksymtab"; else echo "SYMBOL MISSING $sym NOT in Image ksymtab (expected if CFI/HW_TAGS off)"; fi
+            done
+          fi | tee -a artifacts/BUILD_INFO.txt || true
           # Final .config: prefer the real merged config the kernel was
           # built from (gki_kernel/common/.config); fall back to the first
           # .config found. The plain-gki defconfig-check .config is NOT
