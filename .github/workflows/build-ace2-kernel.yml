@@ -194,6 +194,26 @@
 # run 7. Do NOT flash any run 4-7 Image: they are all the same
 # non-LTO kernel.
 #
+# v10 (2026-10-25): run 8 (40125105316) failed at the v9 gate in
+# Normalize -- which is the gate WORKING as designed (it caught the
+# bad config in CI instead of on the phone). The exact error was
+# "CONFIG_LTO_CLANG_FULL is not =y in the normalized .config", even
+# though Normalize now used LLVM=1 + prebuilt clang 12.0.5. The
+# normalized .config (from run 8's partial artifact) shows the full
+# chain: CC_IS_CLANG=y, LD_IS_LLD=y, CLANG_VERSION=120005,
+# ARCH_SUPPORTS_LTO_CLANG=y, SLUB=y, but ARM64_AS_HAS_MTE is absent
+# and ARM64_MTE is absent, so HAVE_ARCH_KASAN_HW_TAGS was never
+# selected, KASAN_HW_TAGS is unselectable, the mode fell back to
+# GENERIC (+KASAN_VMALLOC=y), and HAS_LTO_CLANG stayed false. The
+# missing piece is CROSS_COMPILE: without it clang targets x86_64,
+# so the -march=armv8.5-a+memtag assembler check in as-option fails
+# (the Makefile only adds --target=aarch64-linux-gnu when
+# CROSS_COMPILE is set). build.config.aarch64 sets
+# CROSS_COMPILE=aarch64-linux-gnu- for the real build -- the
+# Normalize step now exports it too, plus the GNU cross binutils on
+# PATH when present. If the v9 gate still trips, its error names the
+# exact option that is still off.
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -464,6 +484,24 @@ jobs:
             echo "Normalize: using prebuilt clang $CLANG_BIN ($("$CLANG_BIN/clang" --version | head -n 1))"
           else
             echo "::warning::Normalize: prebuilt clang not found; kconfig will resolve without LLVM and the v9 gate below will catch a bad result"
+          fi
+          # v10: also export CROSS_COMPILE (and the GNU cross binutils
+          # on PATH when present). Without it, clang targets x86_64, so
+          # the -march=armv8.5-a+memtag assembler check fails,
+          # ARM64_AS_HAS_MTE=n, ARM64_MTE=n, HAVE_ARCH_KASAN_HW_TAGS is
+          # never selected, KASAN_HW_TAGS is unselectable, the KASAN mode
+          # falls back to GENERIC, HAS_LTO_CLANG is false, and the LTO
+          # choice reverts to LTO_NONE -- which is exactly what run 8's
+          # v9 gate caught (LTO_CLANG_FULL not =y even with LLVM=1 and
+          # clang 12.0.5 on PATH). build.config.aarch64 sets
+          # CROSS_COMPILE=aarch64-linux-gnu- for the real build; the
+          # Normalize step must match it.
+          export CROSS_COMPILE=aarch64-linux-gnu-
+          export CROSS_COMPILE_COMPAT=arm-linux-gnueabi-
+          GAS_BIN="$(ls -d "$PWD/../prebuilts/gas/linux-x86/bin" 2>/dev/null || ls -d "$PWD/../prebuilts/gcc/linux-x86/host/"*/bin 2>/dev/null | head -n 1 || true)"
+          if [ -n "$GAS_BIN" ] && [ -x "$GAS_BIN/aarch64-linux-gnu-elfedit" ]; then
+            export PATH="$GAS_BIN:$PATH"
+            echo "Normalize: using GNU cross binutils $GAS_BIN"
           fi
           OUT="$PWD/../out/defconfig-check"
           make LLVM=1 LLVM_IAS=1 ARCH=arm64 O="$OUT" gki_defconfig
