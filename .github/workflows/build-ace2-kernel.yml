@@ -29,6 +29,24 @@
 # (paid) or a self-hosted runner / VPS with a big disk -- see the end of
 # this header in the chat reply, not in the workflow.
 #
+# v3 (2026-10-25): fixed the run-40112227712 failure. The v2 disk fix worked
+# (Maximize/Sync/patches/defconfig-edit all succeeded, run finished in ~4 min),
+# but the OnePlus build script aborts in its check_defconfig pre-step:
+#   "ERROR: savedefconfig does not match common/arch/arm64/configs/gki_defconfig"
+# Root cause, confirmed from the log's diff: the v2 edit appended options
+# missing from the stock file (e.g. SYSVIPC, POSIX_MQUEUE, IP_SET...) to the
+# END of gki_defconfig, while `make savedefconfig` emits them in canonical
+# Kconfig order -- and it drops CONFIG_PID_NS / CONFIG_IPC_NS entirely,
+# because those default to y once NAMESPACES/SYSVIPC are on. The values were
+# right, the file layout was not.
+# Fix: after the text edit, run `make gki_defconfig` + `make savedefconfig`
+# and copy the canonical output over gki_defconfig, then re-run savedefconfig
+# and require an empty diff -- exactly the check oplus_build_kernel.sh does.
+# The authoritative option check now runs against the generated .config
+# (where PID_NS/IPC_NS still show =y via defaults), not the defconfig file.
+# The vendorsetup.sh "No such file" line and the mktemp error in the same
+# log are non-fatal noise: the script continued past both.
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -260,6 +278,40 @@ jobs:
           print("gki_defconfig OK:", ", ".join(enable))
           PYEOF
           grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE|USER_NS|IP6_NF_NAT|IP6_NF_TARGET_MASQUERADE|MACVLAN)=" "kernel/$DEFCONFIG"
+
+      - name: Normalize gki_defconfig with savedefconfig
+        if: inputs.build_mode == 'droidspaces'
+        run: |
+          set -euxo pipefail
+          # oplus_build_kernel.sh runs `make savedefconfig` and diffs the result
+          # against gki_defconfig, failing the build on ANY difference. A text
+          # edit alone can never match that canonical layout, so normalize
+          # the file with the kernel's own kconfig tooling first.
+          # Plain `make` (no LLVM/CROSS_COMPILE) is enough here: defconfig
+          # generation only builds the host kconfig tool, it compiles nothing.
+          cd kernel/kernel_platform/common
+          OUT="$PWD/../out/defconfig-check"
+          make ARCH=arm64 O="$OUT" gki_defconfig
+          make ARCH=arm64 O="$OUT" savedefconfig
+          cp "$OUT/defconfig" arch/arm64/configs/gki_defconfig
+          # Re-run savedefconfig into a fresh dir: this is exactly the check
+          # the OnePlus script performs, and the diff must now be empty.
+          OUT2="$PWD/../out/defconfig-check2"
+          make ARCH=arm64 O="$OUT2" gki_defconfig
+          make ARCH=arm64 O="$OUT2" savedefconfig
+          diff -u arch/arm64/configs/gki_defconfig "$OUT2/defconfig"
+          echo "savedefconfig check passed: gki_defconfig is canonical"
+          # Authoritative option check against the generated .config. Note that
+          # CONFIG_PID_NS / CONFIG_IPC_NS are dropped from the defconfig file
+          # itself by savedefconfig (they default to y), but must still be =y
+          # in .config -- that is what the running kernel will actually have.
+          for opt in CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_PID_NS CONFIG_DEVTMPFS CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_USER_NS CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN CONFIG_NETFILTER_XT_TARGET_REJECT CONFIG_NETFILTER_XT_TARGET_LOG CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_IP_SET CONFIG_IP_SET_HASH_IP CONFIG_IP_SET_HASH_NET CONFIG_NETFILTER_XT_SET CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR; do
+            grep -q "^${opt}=y$" "$OUT/.config" || { echo "ERROR: $opt is not =y in generated .config"; exit 1; }
+          done
+          for opt in CONFIG_CFS_BANDWIDTH CONFIG_CGROUP_PIDS; do
+            if grep -q "^${opt}=y$" "$OUT/.config"; then echo "ERROR: forbidden $opt is enabled in generated .config"; exit 1; fi
+          done
+          echo "all required options are =y in generated .config; forbidden options are off"
 
       - name: Integrate KernelSU (old route, optional)
         if: inputs.integrate_ksu == true
