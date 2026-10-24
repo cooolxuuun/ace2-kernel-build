@@ -123,6 +123,25 @@
 # Collect/Upload now run `if: always()` so a failed build still uploads
 # BUILD_INFO + final .config for diagnosis.
 #
+# v6 (2026-10-25): latest Droidspaces requirements (main branch, DS 7.0.0,
+# HEAD 847ecdd2, 2026-10-24; NO newer tag and NO beta/pre-release tag --
+# main IS the latest). The GKI list in Kernel-Configuration.md on main
+# is UNCHANGED from v4/v5, so no defconfig option changes. What changes
+# is verification: the authoritative check is src/check.c on main.
+# MUST probes (config-mappable): NAMESPACES (+PID/MNT/UTS/IPC/NET/USER),
+# SECCOMP + SECCOMP_FILTER. RECOMMENDED/OPTIONAL probes: loop device,
+# ext4, cgroups, FUSE, TUN, OverlayFS, net namespace, bridge, veth,
+# macvlan, IPv6 NAT, MEMCG, MEMCG_SWAP, devpts/PTY, CPU accounting.
+# CFS_BANDWIDTH and CGROUP_PIDS stay OFF by design (kABI -- see v2-v4
+# header) and are reported as expected greyed-out, never as failures.
+# The Collect step now asserts the FULL probe list against the FINAL
+# merged .config (post-waipio-fragments, the config the kernel really
+# runs) and writes artifacts/DROIDSPACES_CHECK.txt: MUST = hard fail,
+# RECOMMENDED = warn + report, EXPECTED-OFF = report only. The
+# Normalize step keeps its v4 REQUIRED tier and only WARNS on the
+# MUST probe symbols in the plain-gki .config (the fragments can still
+# add them; the final .config is authoritative).
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -401,6 +420,19 @@ jobs:
           for opt in CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_IPC_NS CONFIG_PID_NS CONFIG_DEVTMPFS CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_USER_NS CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN CONFIG_NETFILTER_XT_TARGET_LOG CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_IP_SET CONFIG_IP_SET_HASH_IP CONFIG_IP_SET_HASH_NET CONFIG_NETFILTER_XT_SET CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR; do
             grep -q "^${opt}=y$" "$OUT/.config" || { echo "ERROR: $opt is not =y in generated .config"; exit 1; }
           done
+          # Droidspaces MUST probes (v6, src/check.c on main): namespaces +
+          # seccomp. Warn only here -- the waipio fragments merged by the
+          # OnePlus script can still add them, and the authoritative check
+          # is the final .config in the Collect step. (SECCOMP/SECCOMP_FILTER
+          # are not even named in the stock gki_defconfig file; they come
+          # in via selects/defaults, so absence here proves nothing.)
+          for opt in CONFIG_NAMESPACES CONFIG_UTS_NS CONFIG_MNT_NS CONFIG_SECCOMP CONFIG_SECCOMP_FILTER; do
+            if grep -q "^${opt}=y$" "$OUT/.config"; then
+              echo "droidspaces MUST $opt: =y in plain-gki .config"
+            else
+              echo "WARNING: droidspaces MUST $opt is not =y in the plain-gki .config (final .config check in Collect is authoritative)"
+            fi
+          done
           # OPTIONAL tier (v4): the two 5.10 REJECT targets. They depend on
           # IP_NF_FILTER / IP6_NF_FILTER, which the plain gki_defconfig may
           # leave off and only the waipio fragments enable later, so they
@@ -487,12 +519,65 @@ jobs:
           if [ -n "$BOOTIMG" ]; then
             cp "$BOOTIMG" artifacts/
           fi
-          # Final .config, if the build tree leaves one in an obvious place.
-          DOTCONFIG="$(find kernel -name .config -type f | head -n 1 || true)"
+          # Final .config: prefer the real merged config the kernel was
+          # built from (gki_kernel/common/.config); fall back to the first
+          # .config found. The plain-gki defconfig-check .config is NOT
+          # authoritative -- the waipio fragments change the final config.
+          DOTCONFIG="$(find kernel/kernel_platform/out -name .config -path '*gki_kernel/common/.config' | head -n 1 || true)"
+          if [ -z "$DOTCONFIG" ]; then
+            DOTCONFIG="$(find kernel -name .config -type f | head -n 1 || true)"
+          fi
           if [ -n "$DOTCONFIG" ]; then
             cp "$DOTCONFIG" artifacts/final.config
-            echo "=== requested defconfig options in final .config ==="
-            grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|USER_NS|IP6_NF_NAT|MACVLAN|IP_NF_TARGET_REJECT|IP6_NF_TARGET_REJECT)=" artifacts/final.config || echo "(no matches printed; check final.config manually)"
+            echo "final .config source: $DOTCONFIG" | tee artifacts/DROIDSPACES_CHECK.txt
+            # v6: full Droidspaces requirements check (src/check.c, main,
+            # DS 7.0.0) against the FINAL .config. Tiers:
+            #   MUST (hard fail): without these, Droidspaces refuses to run.
+            #     Namespaces + seccomp, plus the v4 GKI REQUIRED list.
+            #   RECOMMENDED (warn only): optional probes; the app shows
+            #     them as warnings, it does not block on them.
+            #   EXPECTED-OFF (report only): CFS_BANDWIDTH / CGROUP_PIDS
+            #     stay off by design (kABI); --cpus / --pids-limit stay
+            #     greyed out. Never a failure.
+            #   (pivot_root, procfs, sysfs, epoll, signalfd, cgroup v2
+            #   mount: runtime/filesystem probes, no single .config
+            #   symbol -- verified by booting the kernel, not here.)
+            {
+              echo "=== Droidspaces requirements vs final .config (DS main, v7.0.0) ==="
+              echo "--- MUST (fail if not =y) ---"
+              MUST_OK=1
+              for opt in CONFIG_NAMESPACES CONFIG_PID_NS CONFIG_MNT_NS CONFIG_UTS_NS CONFIG_IPC_NS CONFIG_NET_NS CONFIG_USER_NS CONFIG_SECCOMP CONFIG_SECCOMP_FILTER CONFIG_SYSVIPC CONFIG_POSIX_MQUEUE CONFIG_DEVTMPFS CONFIG_NETFILTER_XT_MATCH_ADDRTYPE CONFIG_IP6_NF_NAT CONFIG_IP6_NF_TARGET_MASQUERADE CONFIG_MACVLAN CONFIG_NETFILTER_XT_TARGET_LOG CONFIG_NETFILTER_XT_MATCH_RECENT CONFIG_IP_SET CONFIG_IP_SET_HASH_IP CONFIG_IP_SET_HASH_NET CONFIG_NETFILTER_XT_SET CONFIG_TMPFS_POSIX_ACL CONFIG_TMPFS_XATTR; do
+                if grep -q "^${opt}=y$" artifacts/final.config; then
+                  echo "MUST OK   $opt=y"
+                else
+                  echo "MUST FAIL $opt (want =y, got: $(grep "^${opt}=" artifacts/final.config || grep "^# ${opt} " artifacts/final.config || echo absent))"
+                  MUST_OK=0
+                fi
+              done
+              echo "--- RECOMMENDED (warn only) ---"
+              for opt in CONFIG_BLK_DEV_LOOP CONFIG_EXT4_FS CONFIG_CGROUPS CONFIG_FUSE_FS CONFIG_TUN CONFIG_OVERLAY_FS CONFIG_VETH CONFIG_BRIDGE CONFIG_MEMCG CONFIG_MEMCG_SWAP CONFIG_DEVPTS_FS CONFIG_UNIX98_PTYS CONFIG_CGROUP_CPUACCT; do
+                if grep -q "^${opt}=[ym]$" artifacts/final.config; then
+                  echo "REC OK    $opt=$(grep "^${opt}=" artifacts/final.config)"
+                else
+                  echo "REC WARN  $opt is not enabled (optional probe; app shows a warning, does not block)"
+                fi
+              done
+              echo "--- EXPECTED-OFF by design (kABI; --cpus/--pids-limit greyed out) ---"
+              for opt in CONFIG_CFS_BANDWIDTH CONFIG_CGROUP_PIDS; do
+                echo "OFF (expected) $opt: $(grep "^${opt}=" artifacts/final.config || grep "^# ${opt} " artifacts/final.config || echo absent)"
+              done
+              echo "--- OPTIONAL REJECT targets (5.10 IPv4/IPv6; warn only) ---"
+              for opt in CONFIG_IP_NF_TARGET_REJECT CONFIG_IP6_NF_TARGET_REJECT; do
+                echo "$opt: $(grep "^${opt}=" artifacts/final.config || echo absent)"
+              done
+              if [ "$MUST_OK" != "1" ]; then
+                echo "ERROR: one or more Droidspaces MUST requirements are missing from the final .config"
+                exit 1
+              fi
+              echo "Droidspaces MUST requirements: all present in final .config"
+            } | tee -a artifacts/DROIDSPACES_CHECK.txt
+          else
+            echo "WARNING: no final .config found; Droidspaces check skipped (Image check below still applies)"
           fi
           # A missing Image means the build did not actually produce a kernel,
           # even if the scripts exited without an obvious error.
