@@ -155,6 +155,17 @@
 # loop and Collect hard-fail loop). This run re-proves the same
 # kernel with the corrected check so the repo ends on a green run.
 #
+# v8 (2026-10-25): BOOT FIX -- pass LTO=full to the OnePlus build
+# script (see the Build step). Runs 4-6 built with LTO=none by
+# accident (the script's LTO prompt defaults to "none" in CI), so
+# the kernel had no LTO/CFI/KASAN_HW_TAGS while the stock vendor
+# modules expect them; the phone would not boot after repack+flash.
+# This run rebuilds with full LTO to match the stock kernel the
+# vendor modules were built against. The Collect step now also
+# reports LTO/CFI/KASAN_HW_TAGS in the final .config and whether
+# __cfi_slowpath / kasan_flag_enabled are in the generated ABI
+# symbol list (non-fatal, diagnostic only).
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -498,7 +509,24 @@ jobs:
           echo "KMI_SYMBOL_LIST_STRICT_MODE=${KMI_SYMBOL_LIST_STRICT_MODE:-<unset>}"
           chmod +x kernel_platform/oplus/build/oplus_build_kernel.sh
           chmod +x kernel_platform/oplus/build/oplus_rebuild_img.sh
-          ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio gki
+          # v8 (2026-10-25): BOOT FAILURE FIX -- LTO full. Runs 4-6
+          # compiled fine but the phone would not boot after repack+flash.
+          # Root cause found in the run-6 log: the oplus script's LTO
+          # prompt ("Which would you like? [none]") got an empty answer
+          # in CI, so LTO was unset and the build used LTO_NONE=y -- while
+          # the stock gki_defconfig sets CONFIG_LTO_CLANG_FULL=y,
+          # CONFIG_CFI_CLANG=y and CONFIG_KASAN_HW_TAGS=y. A kernel built
+          # without LTO/CFI does not export __cfi_slowpath (and the
+          # KASAN_HW_TAGS symbol kasan_flag_enabled), which the stock
+          # vendor modules in vendor_dlkm were built against -- so those
+          # modules cannot load and the phone cannot boot. The script
+          # itself says product teams "ship full LTO in production".
+          # Fix: pass "full" as the 3rd argument (choose_lto_type $3)
+          # and export LTO=full as belt-and-braces. Expect a longer
+          # build and higher link memory; the 360-min timeout and the
+          # 4G swap from maximize-build-space cover it.
+          export LTO=full
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio gki full
           # Record the ground truth for the CFI/KASAN question: which of
           # these the final merged .config actually has. (Run 3: CFI off,
           # KASAN_GENERIC on, KASAN_HW_TAGS off -- that is what made the
@@ -537,6 +565,24 @@ jobs:
           if [ -n "$BOOTIMG" ]; then
             cp "$BOOTIMG" artifacts/
           fi
+          # v8: collect Image.lz4 too (the GKI build also produces it;
+          # some repack tools want the compressed image) and record the
+          # LTO/CFI state + whether the two symbols the strict ABI check
+          # missed in run 3 are now present in the generated ABI symbol
+          # list. Diagnostic only -- never fails the run.
+          IMAGELZ4="$(find kernel -name Image.lz4 -type f -path '*arch/arm64/boot/*' | head -n 1 || true)"
+          if [ -n "$IMAGELZ4" ]; then cp "$IMAGELZ4" artifacts/; fi
+          {
+            echo "=== v8 ABI symbol list check ==="
+            SYMLIST="$(find kernel -name abi_symbollist -type f | head -n 1 || true)"
+            if [ -n "$SYMLIST" ]; then
+              for sym in __cfi_slowpath kasan_flag_enabled; do
+                if grep -q "^${sym}$" "$SYMLIST"; then echo "SYMBOL OK   $sym present in abi_symbollist"; else echo "SYMBOL MISSING $sym NOT in abi_symbollist"; fi
+              done
+            else
+              echo "(no abi_symbollist found)"
+            fi
+          } | tee -a artifacts/BUILD_INFO.txt || true
           # Final .config: prefer the real merged config the kernel was
           # built from (gki_kernel/common/.config); fall back to the first
           # .config found. The plain-gki defconfig-check .config is NOT
@@ -593,6 +639,8 @@ jobs:
                 exit 1
               fi
               echo "Droidspaces MUST requirements: all present in final .config"
+              echo "--- v8 LTO/CFI (boot fix) ---"
+              grep -E "^#? ?CONFIG_(LTO_CLANG_FULL|LTO_CLANG_THIN|LTO_NONE|CFI_CLANG|KASAN_HW_TAGS|KASAN_GENERIC)=" artifacts/final.config || echo "(no LTO/CFI lines found)"
             } | tee -a artifacts/DROIDSPACES_CHECK.txt
           else
             echo "WARNING: no final .config found; Droidspaces check skipped (Image check below still applies)"
