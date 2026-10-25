@@ -244,6 +244,25 @@
 # Fix: the Normalize gate now accepts FULL or THIN. The Build-step
 # gate still requires THIN, since the build applies thin.
 #
+# v13 (2026-10-25): run 11 (40132569747, the first LTO/CFI/HW_TAGS
+# kernel, SHA bd2a3f3b...) STILL bootlooped on the phone: first screen,
+# then black screen + reboot, never reaching the desktop. The kernel
+# itself passed every check (v9 gate green, __cfi_slowpath and
+# kasan_flag_enabled present in the Image ksymtab, all 23 Droidspaces
+# MUST =y), so the failure is after the kernel starts -- the prime
+# suspect is CFI in ENFORCING mode. Our kernel is built from the
+# public 16.0.3 source while the phone's vendor_dlkm modules were
+# built against 16.0.5 headers; a single differing function-pointer
+# type hash makes CFI panic the kernel while a vendor module loads.
+# Fix: enable CONFIG_CFI_PERMISSIVE (exists in this 5.10 tree,
+# depends on CFI_CLANG) so a CFI violation warns instead of panics.
+# It changes no exported symbol, so the kABI is unaffected. The other
+# open possibility is that the user booted the artifact boot.img
+# directly (its ramdisk_size=0 -- no ramdisk, no init) instead of
+# repacking the Image into the stock boot backup; that must be ruled
+# out on the phone side before concluding the kernel itself is at
+# fault.
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -454,6 +473,25 @@ jobs:
               "CONFIG_TMPFS_POSIX_ACL",
               "CONFIG_TMPFS_XATTR",
           ]
+          # v13 (2026-10-25): run 11 (the first LTO/CFI/HW_TAGS kernel)
+          # still bootlooped on the phone: first screen, then black
+          # screen + reboot, never reaching the desktop. The kernel
+          # itself is fine (symbols present, v9 gate passed), so the
+          # prime suspect is CFI in ENFORCING mode: our kernel is
+          # built from the public 16.0.3 source while the phone's
+          # vendor_dlkm modules were built against 16.0.5 headers.
+          # If any function-pointer type hash differs between the two,
+          # CFI panics the kernel while a vendor module loads ->
+          # black screen -> reboot. CONFIG_CFI_PERMISSIVE exists in
+          # this 5.10 tree (arch/Kconfig, depends on CFI_CLANG) and
+          # turns a CFI violation into a warning instead of a panic,
+          # so the phone can boot while the mismatch is diagnosed. It
+          # does not change any exported symbol, so the kABI is
+          # unaffected. Verified against run 11's final.config, which
+          # had "# CONFIG_CFI_PERMISSIVE is not set".
+          compat = [
+              "CONFIG_CFI_PERMISSIVE",
+          ]
           forbidden = ["CONFIG_CFS_BANDWIDTH", "CONFIG_CGROUP_PIDS"]
 
           with open(path, encoding="utf-8", errors="surrogateescape") as f:
@@ -465,7 +503,7 @@ jobs:
                       return i
               return None
 
-          for name in enable:
+          for name in enable + compat:
               idx = find(name)
               if idx is None:
                   lines.append(f"{name}=y")
@@ -477,7 +515,7 @@ jobs:
 
           # Verify: every requested option is =y, no forbidden option is =y.
           text = "\n".join(lines)
-          missing = [n for n in enable if f"{n}=y" not in text]
+          missing = [n for n in enable + compat if f"{n}=y" not in text]
           bad = [n for n in forbidden if f"{n}=y" in text]
           if missing:
               print(f"ERROR: missing after edit: {missing}")
@@ -485,7 +523,7 @@ jobs:
           if bad:
               print(f"ERROR: forbidden option enabled: {bad}")
               raise SystemExit(1)
-          print("gki_defconfig OK:", ", ".join(enable))
+          print("gki_defconfig OK:", ", ".join(enable + compat))
           PYEOF
           grep -E "CONFIG_(SYSVIPC|POSIX_MQUEUE|IPC_NS|PID_NS|DEVTMPFS|NETFILTER_XT_MATCH_ADDRTYPE|USER_NS|IP6_NF_NAT|IP6_NF_TARGET_MASQUERADE|MACVLAN)=" "kernel/$DEFCONFIG"
 
