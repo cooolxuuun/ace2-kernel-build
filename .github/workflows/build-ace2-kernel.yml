@@ -1,23 +1,22 @@
-# OnePlus 11R (CPH2487, SM8475 / waipio) kernel build on GitHub Actions
+# OnePlus Ace 2 (PHK110, SM8475 / waipio) kernel build on GitHub Actions
 #
 # Target phone (verified 2026-10-25 from the version-info screenshot):
-#   build  CPH2487_16.0.5.1301(EX01), OxygenOS, Android 16,
-#   security patch 2026-09-01
-#   kernel 5.10.246-android12-9-o-g931a7e2ba585  ->  KMI 5.10-android12-9
-# Source (OnePlusOSS, branch oneplus/sm8475, manifest oneplus_11r_b.xml):
-#   kernel projects at revision oneplus/sm8475_b_16.0.0_oneplus_11r.
-#   WARNING: the public source lags the phone. The 11R revision's
-#   common Makefile is SUBLEVEL 236 (5.10.236), synced to
-#   CPH2487_16.0.1.300 (2026-01-04); the phone runs 5.10.246
-#   (16.0.5.1301, 2026-09-01). There is NO public 5.10.246 source.
-#   WildKernels builds the 11R from this same 5.10.236 revision, so
-#   it is the best available base; the vendor-module gate is the
-#   phone boot test, as always. Do NOT flash blindly: back up the
-#   stock boot.img first, prefer `fastboot boot` for a temporary test.
-#   (History: this repo previously built for the Ace 2 PHK110,
-#   ColorOS 16.0.5.1201, kernel 5.10.236, manifest oneplus_ace2_b.xml,
-#   revision oneplus/sm8475_b_16.0.0_ace_2 -- runs 1-15. The 11R is
-#   the same SM8475 hardware, codename udon.)
+#   build  PHK110_16.0.5.1201(CN01), ColorOS, Android 16,
+#   security patch 2026-08-01
+#   kernel 5.10.236-android12-9-o-g74d132f4467a  ->  KMI 5.10-android12-9
+# Source (OnePlusOSS, branch oneplus/sm8475, manifest oneplus_ace2_b.xml):
+#   kernel projects at revision oneplus/sm8475_b_16.0.0_ace_2.
+#   WARNING: the public source lags the phone's build (latest public
+#   common-kernel sync is PHK110_16.0.3.501, 2026-03-19, while the
+#   phone runs 16.0.5.1201). Kernel sub-version matches (5.10.236),
+#   and run 14 built from this exact source booted and passed all
+#   DroidSpaces checks on this phone/ROM, so the combination is proven.
+#   Always test a new build with `fastboot boot` before flashing.
+#   (History: run 16 (v17) briefly retargeted to the OnePlus 11R
+#   CPH2487 / OxygenOS 16.0.5.1301 (kernel 5.10.246, manifest
+#   oneplus_11r_b.xml); the user flashed back to ColorOS on the Ace 2,
+#   so v18 returns to the Ace 2 source. The 11R is the same SM8475
+#   hardware, codename udon.)
 #
 # v2 (2026-10-24): fixed the "No space left on device" failure seen in the
 # first run, which died in the Sync step after 31m37s before any patch/build
@@ -322,6 +321,16 @@
 # Image, 0 modpost undefined errors, AK3 zip present, SHA different from
 # run 11 (bd2a3f3b...) and run 12 (d12915ac...).
 #
+# v18 (2026-10-25): back to Ace 2 / ColorOS. The user flashed back
+# from the 11R (OxygenOS) to the Ace 2 (PHK110, ColorOS 16.0.5.1201).
+# Manifest oneplus_11r_b.xml -> oneplus_ace2_b.xml (revision
+# oneplus/sm8475_b_16.0.0_ace_2, kernel 5.10.236 -- matches the
+# phone's 5.10.236 exactly). Same WildKernels DroidSpaces patches +
+# direct-make build (v15/v16) and the v16 -dirty fix, same gates.
+# AK3 zip and artifact renamed back to ACE-2. Run 17 acceptance:
+# build succeeds, Image version has no -dirty, __cfi_slowpath
+# present, 23 DroidSpaces MUST =y.
+#
 # v17 (2026-10-25): retarget from Ace 2 (PHK110) to OnePlus 11R
 # (CPH2487, OxygenOS 16.0.5.1301, kernel 5.10.246). The user switched
 # phones/ROMs. Manifest oneplus_ace2_b.xml ->
@@ -353,7 +362,7 @@
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
 #   2. In your repo: Actions -> "Build OnePlus Ace 2 kernel" -> Run workflow.
-#   3. Download the artifact "op11r-kernel-<build_mode>" when it finishes.
+#   3. Download the artifact "ace2-kernel-<build_mode>" when it finishes.
 #   4. Do NOT flash blindly: back up the stock boot.img first, prefer
 #      `fastboot boot <new boot.img>` for a temporary test, and only flash
 #      after the temporary boot passes (calls, mobile data, Wi-Fi, Bluetooth).
@@ -366,7 +375,7 @@
 #   If you deliberately want the old integrated route, set integrate_ksu=true
 #   and a pinned ksu_tag. Do not also install an LKM on the same boot image.
 
-name: Build OnePlus 11R kernel
+name: Build OnePlus Ace 2 kernel
 
 permissions:
   contents: read
@@ -404,12 +413,12 @@ permissions:
 
 jobs:
   build:
-    name: Build 11R kernel (${{ inputs.build_mode }})
+    name: Build Ace 2 kernel (${{ inputs.build_mode }})
     runs-on: ubuntu-22.04
     timeout-minutes: 360
     env:
       MANIFEST_BRANCH: oneplus/sm8475
-      MANIFEST_FILE: oneplus_11r_b.xml
+      MANIFEST_FILE: oneplus_ace2_b.xml
       COMMON_DIR: kernel_platform/common
       DEFCONFIG: kernel_platform/common/arch/arm64/configs/gki_defconfig
       # v5: AOSP GKI ABI strict mode off -- see header. The generic GKI
@@ -908,7 +917,7 @@ jobs:
           ( cd AnyKernel3 && git fetch --depth 1 origin "$AK3_REV" 2>/dev/null && git checkout "$AK3_REV" ) || echo "WARNING: pinned AnyKernel3 revision not available; using default branch"
           cp artifacts/Image AnyKernel3/Image
           sed -i 's/do.check_boot_version=.*/do.check_boot_version=1/' AnyKernel3/anykernel.sh
-          ZIP_NAME="AK3_OP-11R_A16_5.10_DroidSpaces.zip"
+          ZIP_NAME="AK3_OP-ACE-2_A16_5.10_DroidSpaces.zip"
           ( cd AnyKernel3 && zip -r9 "../artifacts/$ZIP_NAME" ./* -x "*.git*" -x "README.md" )
           ls -lh "artifacts/$ZIP_NAME"
           sha256sum "artifacts/$ZIP_NAME" | tee -a artifacts/BUILD_INFO.txt
@@ -917,7 +926,7 @@ jobs:
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: op11r-kernel-${{ inputs.build_mode }}
+          name: ace2-kernel-${{ inputs.build_mode }}
           path: artifacts/
           if-no-files-found: warn
           retention-days: 30
