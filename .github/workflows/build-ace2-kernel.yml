@@ -263,6 +263,32 @@
 # out on the phone side before concluding the kernel itself is at
 # fault.
 #
+# v14 (2026-10-25): run 12 (40152667525, v13) SUCCEEDED in CI but is
+# NOT USABLE and was NOT delivered. Its Image has NO __cfi_slowpath
+# in the ksymtab, and the build log has 162 modpost errors
+# ' "__cfi_slowpath" [<mod>.ko] undefined!' (phy-qcom-ufs, pci-msm-drv,
+# pinctrl-msm, clk-qcom, mhi, msm_kgsl, ...). Run 11's log had 0.
+# Root cause, verified against kernel/cfi.c in this tree: with
+# CONFIG_CFI_PERMISSIVE the macro renames the exported handler from
+# __cfi_slowpath to __cfi_slowpath_diag -- but clang emits calls to
+# __cfi_slowpath from instrumented code regardless of mode (all 162
+# errors name __cfi_slowpath, 0 name the diag variant), and the stock
+# vendor modules were built enforcing-mode, so they need __cfi_slowpath
+# too. The warn-vs-panic behaviour does NOT depend on the rename:
+# handle_cfi_failure() checks IS_ENABLED(CONFIG_CFI_PERMISSIVE).
+# Fix: a 1-line patch to kernel/cfi.c (applied like the kABI patches)
+# keeps the exported name __cfi_slowpath in both modes, so the 162
+# modules load AND a CFI violation still only warns. Nothing references
+# __cfi_slowpath_diag. Two process fixes from the same incident: (a)
+# the Build step now tees its output and fails on any modpost
+# 'undefined!' error (run 12's modpost Error 1 was swallowed by the
+# oplus script, so the run wrongly concluded success); (b) the Collect
+# symbol check is now a HARD FAIL when CFI_CLANG=y but __cfi_slowpath
+# is missing from the Image. Run 13 acceptance: final.config still
+# CFI_PERMISSIVE=y + THIN/CFI/HW_TAGS, __cfi_slowpath present in the
+# Image, 0 modpost __cfi_slowpath errors, SHA different from run 11
+# (bd2a3f3b...) and run 12 (d12915ac...).
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -430,6 +456,39 @@ jobs:
           patch -p1 --dry-run < ../../../patches/002-posix-mqueue.patch
           patch -p1 < ../../../patches/002-posix-mqueue.patch
           echo "kabi_patches_applied=001-sysvipc-kabi_${{ inputs.kabi_patch_variant }},002-posix-mqueue" >> ../../../BUILD_INFO.txt
+
+      - name: Patch kernel/cfi.c (v14, keep __cfi_slowpath name)
+        if: inputs.build_mode == 'droidspaces'
+        run: |
+          set -euxo pipefail
+          python3 - <<'PYEOF'
+          # v14 (2026-10-25): run 12 (v13, CFI_PERMISSIVE) built and
+          # "succeeded", but its Image has NO __cfi_slowpath in the
+          # ksymtab, and the build log has 162 modpost errors
+          # ' "__cfi_slowpath" [<mod>.ko] undefined!' -- including
+          # phy-qcom-ufs, pci-msm-drv, pinctrl-msm, clk-qcom, mhi,
+          # msm_kgsl. Run 11's log had 0. Root cause, verified against
+          # kernel/cfi.c in this tree: with CONFIG_CFI_PERMISSIVE the
+          # macro renames the exported handler from __cfi_slowpath to
+          # __cfi_slowpath_diag -- but clang emits calls to
+          # __cfi_slowpath from instrumented code regardless of mode
+          # (all 162 errors name __cfi_slowpath, 0 name the diag
+          # variant), and the stock vendor modules were built
+          # enforcing-mode, so they need __cfi_slowpath too. The
+          # warn-vs-panic behaviour does NOT depend on the rename:
+          # handle_cfi_failure() checks IS_ENABLED(CFI_PERMISSIVE).
+          # So keep the exported name __cfi_slowpath in both modes.
+          # Nothing references __cfi_slowpath_diag (0 modpost hits).
+          import pathlib
+          f = pathlib.Path("kernel/kernel_platform/common/kernel/cfi.c")
+          text = f.read_text()
+          old = "#define cfi_slowpath_handler\t__cfi_slowpath_diag"
+          assert old in text, "cfi.c permissive handler define not found"
+          text = text.replace(old, "#define cfi_slowpath_handler\t__cfi_slowpath", 1)
+          f.write_text(text)
+          assert "__cfi_slowpath_diag" not in f.read_text(), "diag rename still present"
+          print("cfi.c patched: permissive handler stays __cfi_slowpath")
+          PYEOF
 
       - name: Edit gki_defconfig (in place, GKI list only)
         if: inputs.build_mode == 'droidspaces'
@@ -716,7 +775,19 @@ jobs:
           # __cfi_slowpath, but its link uses far less memory. Switch
           # to thin; the v9 gate below is updated to require THIN.
           export LTO=thin
-          ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio gki thin
+          ./kernel_platform/oplus/build/oplus_build_kernel.sh waipio gki thin 2>&1 | tee ../build.log
+          # v14: modpost undefined-symbol errors must fail the run.
+          # Run 12's build had 162 'modpost: "__cfi_slowpath"
+          # undefined!' errors yet concluded success because
+          # oplus_build_kernel.sh did not propagate modpost's Error 1.
+          # A kernel whose modules cannot load must never be delivered
+          # as a success. (pipefail is set, so a failing build script
+          # still fails this step before we get here.)
+          if grep -q 'modpost: .* undefined!' ../build.log; then
+            echo "ERROR: modpost reported undefined symbols:"
+            grep 'modpost: .* undefined!' ../build.log | sort -u | head -n 20
+            exit 1
+          fi
           # Record the ground truth for the CFI/KASAN question: which of
           # these the final merged .config actually has. (Run 3: CFI off,
           # KASAN_GENERIC on, KASAN_HW_TAGS off -- that is what made the
@@ -849,6 +920,16 @@ jobs:
             } | tee -a artifacts/DROIDSPACES_CHECK.txt
           else
             echo "WARNING: no final .config found; Droidspaces check skipped (Image check below still applies)"
+          fi
+          # v14: __cfi_slowpath missing is a HARD FAIL when the final
+          # .config has CFI_CLANG=y. Run 12 proved the old warn-only
+          # check lets a broken kernel through: its Image had no
+          # __cfi_slowpath, 162 modules could not load, yet the run
+          # concluded success. kasan_flag_enabled stays warn-only (its
+          # absence only matters if KASAN_HW_TAGS is on, which the
+          # .config gate already enforces).
+          if [ -f artifacts/final.config ] && grep -q "^CONFIG_CFI_CLANG=y$" artifacts/final.config && [ -f artifacts/Image ]; then
+            strings artifacts/Image | grep -q "^__cfi_slowpath$" || { echo "ERROR: v14 gate: CFI_CLANG=y but __cfi_slowpath is NOT in the Image ksymtab -- modules cannot load (run 12 regression)"; exit 1; }
           fi
           # A missing Image means the build did not actually produce a kernel,
           # even if the scripts exited without an obvious error.
