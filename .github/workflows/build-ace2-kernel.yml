@@ -314,6 +314,22 @@
 # Image, 0 modpost undefined errors, AK3 zip present, SHA different from
 # run 11 (bd2a3f3b...) and run 12 (d12915ac...).
 #
+# v16 (2026-10-25): fix the "-dirty" suffix in the kernel version string.
+# Run 14's Image reports "Linux version 5.10.236-o-g694ce6ff5393-dirty":
+# scripts/setlocalversion appends -dirty when the git working tree has
+# uncommitted changes -- here, the 3 kABI patches + the gki_defconfig
+# edit, all applied in kernel_platform/common. Fix: commit them in the
+# local runner repo before building, so the tree is clean and the
+# version becomes 5.10.236-o-g<new-commit> with no -dirty. The commit
+# is local to the runner only and is never pushed. Untracked build
+# artifacts (out/, ld-wrapper) do not affect the check: setlocalversion
+# uses `git status -uno --porcelain` (-uno = no untracked files).
+# The version still lacks the stock "-android12-9" (CONFIG_LOCALVERSION
+# is empty in the direct-make build; stock gets it from the branch arg
+# passed to setlocalversion). That is cosmetic only -- run 14 boots and
+# loads vendor modules fine without it -- and is left alone.
+# Run 15 acceptance: Image version has no -dirty (hard gate in Collect).
+#
 # How to use:
 #   1. Put this file in YOUR OWN repo at .github/workflows/build-ace2-kernel.yml
 #      (it does not have to live in the kernel source repo; it clones everything).
@@ -649,6 +665,40 @@ jobs:
             exit 1
           fi
 
+      - name: Commit source changes (clean tree, remove -dirty suffix)
+        run: |
+          set -euxo pipefail
+          # v16: commit the kABI patches + defconfig edit in the local
+          # common repo so scripts/setlocalversion sees a clean tree
+          # and does NOT append -dirty to the kernel version.
+          # (Run 14: 5.10.236-o-g694ce6ff5393-dirty.)
+          # The commit is local to the runner only, never pushed.
+          cd kernel/$COMMON_DIR
+          git config user.email "kernel-builder@local"
+          git config user.name "Kernel Builder"
+          # Stage all source changes, but NOT the build output dir
+          # (out/) or the ld-wrapper helper -- those are untracked
+          # build artifacts. Note: setlocalversion uses
+          # `git status -uno --porcelain`, so untracked files would
+          # not trigger -dirty anyway; this is just hygiene.
+          git add -A
+          git reset -q -- out ld-wrapper 2>/dev/null || true
+          git commit -m "droidspaces: apply kABI patches + gki_defconfig (clean tree, no -dirty)" || echo "nothing to commit"
+          echo "=== git status after commit (should show only untracked build artifacts) ==="
+          git status --porcelain || true
+          echo "=== new HEAD ==="
+          git log -1 --oneline
+          # v16 gate: the version suffix must not contain -dirty.
+          # scripts/setlocalversion <srctree> prints the suffix the
+          # build will use (e.g. -o-g<hash>); run it directly.
+          echo "=== setlocalversion check ==="
+          VERSION_SUFFIX="$(./scripts/setlocalversion . 2>/dev/null || true)"
+          echo "setlocalversion suffix: ${VERSION_SUFFIX:-<empty>}"
+          case "$VERSION_SUFFIX" in
+            *dirty*) echo "ERROR: v16 gate: version suffix still contains -dirty: $VERSION_SUFFIX"; exit 1;;
+            *) echo "v16 gate passed: no -dirty in version suffix ($VERSION_SUFFIX)";;
+          esac
+
       - name: Build kernel (v15, direct make)
         run: |
           set -euxo pipefail
@@ -805,6 +855,19 @@ jobs:
           # .config gate already enforces).
           if [ -f artifacts/final.config ] && grep -q "^CONFIG_CFI_CLANG=y$" artifacts/final.config && [ -f artifacts/Image ]; then
             strings artifacts/Image | grep -q "^__cfi_slowpath$" || { echo "ERROR: v14 gate: CFI_CLANG=y but __cfi_slowpath is NOT in the Image ksymtab -- modules cannot load (run 12 regression)"; exit 1; }
+          fi
+          # v16: the Image version string must not contain -dirty.
+          # Run 14 shipped 5.10.236-o-g694ce6ff5393-dirty; the commit
+          # step above should have removed it. Hard fail if it is
+          # still there.
+          if [ -f artifacts/Image ]; then
+            VER_LINE="$(strings artifacts/Image | grep -E '^Linux version 5\.10\.' | head -n 1 || true)"
+            echo "Image version line: ${VER_LINE:-<not found>}"
+            case "$VER_LINE" in
+              *dirty*) echo "ERROR: v16 gate: Image version contains -dirty: $VER_LINE"; exit 1;;
+              *) echo "v16 gate passed: Image version has no -dirty";;
+            esac
+            echo "kernel_version=$VER_LINE" >> artifacts/BUILD_INFO.txt
           fi
           # A missing Image means the build did not actually produce a kernel,
           # even if the scripts exited without an obvious error.
